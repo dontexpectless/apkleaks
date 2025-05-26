@@ -8,6 +8,8 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
+import subprocess
 
 from contextlib import closing
 from shutil import which
@@ -90,12 +92,27 @@ class APKLeaks:
 		util.writeln("** Decompiling APK...", col.OKBLUE)
 		args = [self.jadx, self.file, "-d", self.tempdir]
 		try:
-			args.extend(re.split(r"\s|=", self.disarg))
+			args.extend(re.split(r"\\s|=", self.disarg))
 		except Exception:
 			pass
-		comm = "%s" % (" ".join(quote(arg) for arg in args))
-		comm = comm.replace("\'","\"")
-		os.system(comm)
+		# Use Popen to capture stderr
+		try:
+			process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+			stdout, stderr = process.communicate()
+
+			# Print stderr and write to output file
+			if stderr:
+				util.writeln("** Jadx stderr output:", col.WARNING)
+				print(stderr) # Print to console
+				self.fileout.write("\n** Jadx stderr output:\n")
+				self.fileout.write(stderr)
+
+			if process.returncode != 0:
+				util.writeln(f"Error running jadx: Command '{' '.join(args)}' returned non-zero exit status {process.returncode}.", col.WARNING)
+				# Note: The exception handling below might still be triggered
+
+		except Exception as e:
+			util.writeln(f"Error running jadx: {e}", col.WARNING)
 
 	def extract(self, name, matches):
 		if len(matches):
@@ -137,7 +154,50 @@ class APKLeaks:
 					except KeyboardInterrupt:
 						sys.exit(util.writeln("\n** Interrupted. Aborting...", col.FAIL))
 
+	def copy_decompiled_files(self):
+		"""Copies decompiled files from tempdir to a new directory near the original APK."""
+		try:
+			# Get the directory of the input APK file
+			# apk_dir = os.path.dirname(self.file)
+			# Get the current working directory where the script is being run
+			current_dir = os.getcwd()
+
+			# Get the base name of the input APK file without extension
+			apk_basename = os.path.basename(self.file)
+			apk_name_without_ext = os.path.splitext(apk_basename)[0]
+
+			# Define the new directory name
+			# Using '-extracted' as it describes the content well
+			dest_dir_name = f"{apk_name_without_ext}-extracted"
+			dest_path = os.path.join(current_dir, dest_dir_name)
+
+			util.writeln(f"\n** Copying decompiled files to '{dest_path}'...", col.OKBLUE)
+
+			# Ensure the destination directory exists and is empty or create it
+			if os.path.exists(dest_path):
+				if os.listdir(dest_path): # Check if directory is not empty
+					util.writeln(f"Warning: Destination directory '{dest_path}' is not empty. Files might be overwritten or merged.", col.WARNING)
+				# shutil.rmtree(dest_path) # Option to clear it first
+				# os.makedirs(dest_path) # Option to recreate it
+			else:
+				os.makedirs(dest_path)
+
+			# Copy the contents of the temporary directory
+			# copytree requires the destination to NOT exist, or use dirs_exist_ok=True (Python 3.8+)
+			# Let's handle pre-creating the dir and using copytree carefully
+			# A safer way for older Python versions is to copy contents item by item,
+			# but shutil.copytree is more efficient.
+			# Given the environment is Python 3.13, dirs_exist_ok should work.
+			shutil.copytree(self.tempdir, dest_path, dirs_exist_ok=True)
+
+			util.writeln(f"** Decompiled files copied successfully to '{dest_path}'.", col.OKGREEN)
+
+		except Exception as e:
+			util.writeln(f"Error copying decompiled files: {e}", col.WARNING)
+
 	def cleanup(self):
+		# Copy files before cleaning up tempdir
+		self.copy_decompiled_files()
 		shutil.rmtree(self.tempdir)
 		if self.scanned:
 			self.fileout.write("%s" % (json.dumps(self.out_json, indent=4) if self.json else ""))
@@ -145,5 +205,10 @@ class APKLeaks:
 			print("%s\n** Results saved into '%s%s%s%s'%s." % (col.HEADER, col.ENDC, col.OKGREEN, self.output, col.HEADER, col.ENDC))
 		else:
 			self.fileout.close()
-			os.remove(self.output)
+			for _ in range(5):  # Intenta varias veces por si el sistema tarda en liberar el archivo
+				try:
+					os.remove(self.output)
+					break
+				except PermissionError:
+					time.sleep(0.2)
 			util.writeln("\n** Done with nothing. ¯\\_(ツ)_/¯", col.WARNING)
